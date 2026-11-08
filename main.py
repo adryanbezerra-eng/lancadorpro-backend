@@ -304,23 +304,25 @@ def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, taxa_j
         raise HTTPException(status_code=404, detail="Nenhuma opção encontrada para este ativo.")
 
     # Passo 2: Disparo direto buscando apenas as opções daquele vencimento exato
-    query_dados = f"""
-        SELECT ticker, tipo_opcao, strike, dias_para_vencimento, preco_fechamento 
-        FROM 'historico_opcoes.parquet'
-        WHERE ticker LIKE '{ticker.upper()}%'
-          AND dias_para_vencimento = {vencimento_alvo}
-          AND preco_fechamento > 0
-        ORDER BY strike ASC
-    """
+query_dados = f"""
+    SELECT ticker, tipo_opcao, strike, dias_para_vencimento, preco_fechamento 
+    FROM 'historico_opcoes.parquet'
+    WHERE ticker LIKE '{ticker.upper()}%'
+      AND dias_para_vencimento = {vencimento_alvo}
+      AND preco_fechamento > 0
+    ORDER BY strike ASC
+"""
+
+try:
+    # Executa a busca nova e liberta o servidor imediatamente a seguir
     df = con.execute(query_dados).df()
-    con.close() # Libera a conexão para não travar o servidor Render
+    con.close() 
     
-    try:
-        df = con.execute(query).fetchdf()
-        if df.empty: return {"erro": "Nenhuma opção encontrada."}
-        
-        T_dias = int(df['dias_para_vencimento'].iloc[0])
-        T_anos = T_dias / 252.0
+    if df.empty: 
+        return {"erro": "Nenhuma opção encontrada."}
+    
+    T_dias = int(df['dias_para_vencimento'].iloc[0])
+    T_anos = T_dias / 252.0
         
         iv_calculada = []
         pop_calculada = []
