@@ -23,19 +23,15 @@ def verificar_api_key(api_key: str = Security(api_key_header)):
         raise HTTPException(status_code=403, detail="Acesso negado. Cão de guarda ativado.")
     return api_key
 
-# 2. Fechamento do CORS (Lista de Convidados)
+# 2. CORS Liberado com Suporte a Todos os Ambientes (Preview, Localhost e Produção)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",           
-        "https://lancadorpro.lovable.app", 
-        "https://lancadorpro.app",         # <--- ADICIONE ESTA LINHA COM O SEU DOMÍNIO OFICIAL
-        "https://www.lancadorpro.app",     # <--- ADICIONE ESTA TAMBÉM POR GARANTIA
-    ],
-    allow_credentials=True,
-    allow_methods=["GET"],                 
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # =====================================================================
 # 1. MOTORES DE PRECIFICAÇÃO, VOLATILIDADE E GESTÃO (BS, BINOMIAL, POP, KELLY)
