@@ -289,18 +289,31 @@ def status_motor():
 def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, taxa_juros: float = 0.105):
     con = duckdb.connect()
     
-    query = f"""
+    # Passo 1: Disparo rápido apenas para descobrir o vencimento alvo
+    query_vencimento = f"""
+        SELECT MIN(dias_para_vencimento) 
+        FROM 'historico_opcoes.parquet' 
+        WHERE ticker LIKE '{ticker.upper()}%' 
+          AND dias_para_vencimento >= {dias_minimos}
+    """
+    resultado = con.execute(query_vencimento).fetchone()
+    vencimento_alvo = resultado[0] if resultado else None
+    
+    if vencimento_alvo is None:
+        con.close()
+        raise HTTPException(status_code=404, detail="Nenhuma opção encontrada para este ativo.")
+
+    # Passo 2: Disparo direto buscando apenas as opções daquele vencimento exato
+    query_dados = f"""
         SELECT ticker, tipo_opcao, strike, dias_para_vencimento, preco_fechamento 
         FROM 'historico_opcoes.parquet'
         WHERE ticker LIKE '{ticker.upper()}%'
-          AND dias_para_vencimento = (
-              SELECT MIN(dias_para_vencimento) 
-              FROM 'historico_opcoes.parquet' 
-              WHERE ticker LIKE '{ticker.upper()}%' AND dias_para_vencimento >= {dias_minimos}
-          )
+          AND dias_para_vencimento = {vencimento_alvo}
           AND preco_fechamento > 0
         ORDER BY strike ASC
     """
+    df = con.execute(query_dados).df()
+    con.close() # Libera a conexão para não travar o servidor Render
     
     try:
         df = con.execute(query).fetchdf()
