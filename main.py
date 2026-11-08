@@ -304,26 +304,26 @@ def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, taxa_j
         raise HTTPException(status_code=404, detail="Nenhuma opção encontrada para este ativo.")
 
     # Passo 2: Disparo direto buscando apenas as opções daquele vencimento exato
-query_dados = f"""
-    SELECT ticker, tipo_opcao, strike, dias_para_vencimento, preco_fechamento 
-    FROM 'historico_opcoes.parquet'
-    WHERE ticker LIKE '{ticker.upper()}%'
-      AND dias_para_vencimento = {vencimento_alvo}
-      AND preco_fechamento > 0
-    ORDER BY strike ASC
-"""
+    query_dados = f"""
+        SELECT ticker, tipo_opcao, strike, dias_para_vencimento, preco_fechamento 
+        FROM 'historico_opcoes.parquet'
+        WHERE ticker LIKE '{ticker.upper()}%'
+          AND dias_para_vencimento = {vencimento_alvo}
+          AND preco_fechamento > 0
+        ORDER BY strike ASC
+    """
 
-try:
-    # Executa a busca nova e liberta o servidor imediatamente a seguir
-    df = con.execute(query_dados).df()
-    con.close() 
-    
-    if df.empty: 
-        return {"erro": "Nenhuma opção encontrada."}
-    
-    T_dias = int(df['dias_para_vencimento'].iloc[0])
-    T_anos = T_dias / 252.0
+    try:
+        # Executa a busca nova e libera o servidor imediatamente a seguir
+        df = con.execute(query_dados).df()
+        con.close() 
         
+        if df.empty: 
+            return {"erro": "Nenhuma opção encontrada."}
+        
+        T_dias = int(df['dias_para_vencimento'].iloc[0])
+        T_anos = T_dias / 252.0
+            
         iv_calculada = []
         pop_calculada = []
         be_calculado = []
@@ -358,7 +358,8 @@ try:
             (df['moneyness'] < 1.30)
         ].copy()
         
-        if df_limpo.empty: return {"erro": "Filtro de liquidez vazio."}
+        if df_limpo.empty: 
+            return {"erro": "Filtro de liquidez vazio."}
         
         df_otm = df_limpo[
             ((df_limpo['tipo_opcao'] == 'CALL') & (df_limpo['strike'] >= preco_spot)) |
@@ -392,7 +393,8 @@ try:
 @app.get("/api/vrp/{ticker}", dependencies=[Depends(verificar_api_key)])
 def analise_vrp(ticker: str, iv_atual: float, dte: int):
     cone_data = calcular_cone_volatilidade(ticker)
-    if isinstance(cone_data, dict) and "erro" in cone_data: return cone_data
+    if isinstance(cone_data, dict) and "erro" in cone_data: 
+        return cone_data
     alerta = avaliar_vrp(iv_atual, dte, cone_data)
     return {"ativo": ticker.upper(), "iv_atual": iv_atual, "dte": dte, "cone": cone_data, "insight_vrp": alerta}
 
