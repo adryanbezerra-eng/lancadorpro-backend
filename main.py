@@ -281,7 +281,7 @@ def gerar_matriz_choque(S, K, T_dias, r, sigma_atual, premio_recebido, tipo_opca
 
 @app.get("/")
 def status_motor():
-    return {"status": "Operacional", "versao": "11.0 - API Totalmente Blindada (CORS + Chave)"}
+    return {"status": "Operacional", "versao": "12.0 - Otimização Extrema de Loop Pré-Filtro"}
 
 @app.get("/api/sinais/{ticker}", dependencies=[Depends(verificar_api_key)])
 def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, taxa_juros: float = 0.105):
@@ -321,6 +321,17 @@ def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, taxa_j
         
         T_dias = int(df['dias_para_vencimento'].iloc[0])
         T_anos = T_dias / 252.0
+        
+        # =============================================================
+        # OTIMIZAÇÃO EXTREMA: FILTRA O LIXO ANTES DA MATEMÁTICA PESADA
+        # =============================================================
+        df['moneyness'] = df['strike'] / preco_spot
+        # Mantém apenas as opções entre 70% e 130% do preço atual da ação
+        df = df[(df['moneyness'] > 0.70) & (df['moneyness'] < 1.30)].copy()
+
+        if df.empty: 
+            print("🚨 ERRO: Nenhuma opção com liquidez próxima ao preço (moneyness).")
+            return {"erro": "Nenhuma opção encontrada perto do preço atual."}
             
         iv_calculada = []
         pop_calculada = []
@@ -348,17 +359,12 @@ def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, taxa_j
         df['pop'] = pop_calculada
         df['kelly_frac'] = kelly_calculado 
         
-        df['moneyness'] = df['strike'] / preco_spot
-        df_limpo = df[
-            (df['vol_implicita'] > 0.01) & 
-            (df['vol_implicita'] < 2.50) & 
-            (df['moneyness'] > 0.70) & 
-            (df['moneyness'] < 1.30)
-        ].copy()
+        # Filtro final de liquidez (remover IVs absurdos que possam ter sobrado)
+        df_limpo = df[(df['vol_implicita'] > 0.01) & (df['vol_implicita'] < 2.50)].copy()
         
         if df_limpo.empty: 
-            print("🚨 ERRO: Filtro de liquidez vazio. 🚨")
-            return {"erro": "Filtro de liquidez vazio."}
+            print("🚨 ERRO: Filtro de volatilidade vazio. 🚨")
+            return {"erro": "Filtro de volatilidade vazio."}
         
         df_otm = df_limpo[
             ((df_limpo['tipo_opcao'] == 'CALL') & (df_limpo['strike'] >= preco_spot)) |
