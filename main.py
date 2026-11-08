@@ -27,11 +27,13 @@ def verificar_api_key(api_key: str = Security(api_key_header)):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",           # Para os seus testes locais
-        "https://lancadorpro.lovable.app", # Domínio oficial gerado no Lovable
+        "http://localhost:5173",           
+        "https://lancadorpro.lovable.app", 
+        "https://lancadorpro.app",         # <--- ADICIONE ESTA LINHA COM O SEU DOMÍNIO OFICIAL
+        "https://www.lancadorpro.app",     # <--- ADICIONE ESTA TAMBÉM POR GARANTIA
     ],
     allow_credentials=True,
-    allow_methods=["GET"],                 # Permite apenas leitura (proteção extra)
+    allow_methods=["GET"],                 
     allow_headers=["*"],
 )
 
