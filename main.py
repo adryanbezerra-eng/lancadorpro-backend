@@ -185,7 +185,7 @@ def calibrar_svi_superficie(df_opcoes, S, T_dias, r):
 
 @app.get("/")
 def status_motor():
-    return {"status": "Operacional", "versao": "13.0 - Seleção Dinâmica de Vencimentos"}
+    return {"status": "Operacional", "versao": "14.0 - Correção de Colunas e Vencimentos Dinâmicos"}
 
 @app.get("/api/vencimentos/{ticker}", dependencies=[Depends(verificar_api_key)])
 def listar_vencimentos(ticker: str):
@@ -195,7 +195,6 @@ def listar_vencimentos(ticker: str):
         SELECT DISTINCT dias_para_vencimento 
         FROM 'historico_opcoes.parquet' 
         WHERE ticker LIKE '{ticker.upper()}%' 
-          AND data = (SELECT MAX(data) FROM 'historico_opcoes.parquet')
           AND dias_para_vencimento > 0
         ORDER BY dias_para_vencimento ASC
     """
@@ -222,7 +221,6 @@ def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, dias_a
             SELECT MIN(dias_para_vencimento) 
             FROM 'historico_opcoes.parquet' 
             WHERE ticker LIKE '{ticker.upper()}%' 
-              AND data = (SELECT MAX(data) FROM 'historico_opcoes.parquet')
               AND dias_para_vencimento >= {dias_minimos}
         """
         resultado = con.execute(query_vencimento.strip()).fetchone()
@@ -232,12 +230,11 @@ def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, dias_a
         con.close()
         raise HTTPException(status_code=404, detail="Nenhum vencimento válido foi encontrado para este ativo.")
 
-    # Puxa os dados estritamente do último dia e do vencimento alvo selecionado
+    # Puxa os dados estritamente do vencimento alvo selecionado
     query_dados = f"""
         SELECT ticker, tipo_opcao, strike, dias_para_vencimento, preco_fechamento 
         FROM 'historico_opcoes.parquet'
         WHERE ticker LIKE '{ticker.upper()}%'
-          AND data = (SELECT MAX(data) FROM 'historico_opcoes.parquet')
           AND dias_para_vencimento = {vencimento_alvo}
           AND preco_fechamento > 0
           AND dias_para_vencimento > 0
