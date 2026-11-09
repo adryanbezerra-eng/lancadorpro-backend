@@ -36,11 +36,9 @@ app.add_middleware(
 # CONSTANTES B3 E CÁLCULO DE DIAS ÚTEIS (LÓGICA OFICIAL)
 # =====================================================================
 
-# Mapeamento oficial de séries B3 por mês (1 a 12)
 SERIES_B3_CALL = {1: 'A', 2: 'B', 3: 'C', 4: 'D', 5: 'E', 6: 'F', 7: 'G', 8: 'H', 9: 'I', 10: 'J', 11: 'K', 12: 'L'}
 SERIES_B3_PUT  = {1: 'M', 2: 'N', 3: 'O', 4: 'P', 5: 'Q', 6: 'R', 7: 'S', 8: 'T', 9: 'U', 10: 'V', 11: 'W', 12: 'X'}
 
-# Feriados nacionais B3 (2026/2027)
 FERIADOS_B3 = {
     "2026-01-01", "2026-02-16", "2026-02-17", "2026-04-03", "2026-04-21", "2026-05-01",
     "2026-06-04", "2026-09-07", "2026-10-12", "2026-11-02", "2026-11-20", "2026-12-24",
@@ -68,7 +66,7 @@ def parse_data_vencimento(v: Optional[str]) -> Optional[date]:
     return None
 
 # =====================================================================
-# 1. MOTORES DE PRECIFICAÇÃO, VOLATILIDADE E GESTÃO
+# 1. MOTORES DE PRECIFICAÇÃO E GESTÃO
 # =====================================================================
 
 def calcular_preco_bs(S, K, T, r, sigma, tipo):
@@ -188,7 +186,7 @@ def calcular_kelly_otm(pop: float, multiplicador_stop_loss: float = 3.0):
     return round(kelly_full / 4.0, 4)
 
 # =====================================================================
-# 2. MOTOR SVI (STOCHASTIC VOLATILITY INSPIRED)
+# 2. MOTOR SVI
 # =====================================================================
 
 def svi_variancia_total(k, params):
@@ -236,7 +234,7 @@ def calibrar_svi_superficie(df_opcoes, S, T_dias, r):
 
 @app.get("/")
 def status_motor():
-    return {"status": "Operacional", "versao": "18.0 - Motor Completo com Matriz de Choque (Preço vs Volatilidade)"}
+    return {"status": "Operacional", "versao": "19.0 - Motor Integral (SVI, Matriz, VRP)"}
 
 @app.get("/api/vencimentos/{ticker}", dependencies=[Depends(verificar_api_key)])
 def listar_vencimentos(ticker: str):
@@ -412,29 +410,24 @@ def buscar_sinais(
 
 
 # =====================================================================
-# 4. MOTOR DE MATRIZ DE CHOQUE E ANÁLISE DE RISCO (FRONTEND COMPATÍVEL)
+# 4. MOTOR DE MATRIZ DE CHOQUE E ANÁLISE DE RISCO
 # =====================================================================
 
 def gerar_matriz_choque(S: float, K: float, T_dias: int, r: float, sigma_atual: float, premio: float, tipo: str, lotes: int = 100):
     T_anos = max(1, T_dias) / 252.0
     
-    # 5 cenários de volatilidade (-10%, -5%, 0%, +5%, +10% em pontos absolutos de vol)
     choques_vol = [-0.10, -0.05, 0.0, +0.05, +0.10]
     eixo_vol = [max(0.01, round(sigma_atual + delta, 4)) for delta in choques_vol]
     
-    # 7 cenários de preço (-15%, -10%, -5%, 0%, +5%, +10%, +15%)
     variacoes_preco = [-15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0]
     
     matriz_pnl = []
-    
     for var_pct in variacoes_preco:
         S_sim = round(S * (1.0 + var_pct / 100.0), 2)
         linha_pnl = []
         
         for vol_sim in eixo_vol:
             preco_opcao_cenario = calcular_preco_bs(S_sim, K, T_anos, r, vol_sim, tipo)
-            
-            # Posição VENDIDA (Lançador): Lucro = (Prêmio recebido - Preço novo) * quantidade
             pnl_unitario = premio - preco_opcao_cenario
             pnl_total = round(pnl_unitario * lotes, 2)
             linha_pnl.append(pnl_total)
@@ -467,6 +460,67 @@ def simular_choque(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# =====================================================================
+# 5. MOTOR DE CONE DE VOLATILIDADE E VRP (SINTÉTICO LOVABLE)
+# =====================================================================
+
+def calcular_cone_vrp(ticker: str, iv_atual: float, dte: int):
+    prazos = [5, 10, 15, 21, 30, 45, 60]
+    
+    vol_base = max(0.15, min(1.20, iv_atual))
+    
+    cone = []
+    for dias in prazos:
+        fator = (dias / 21.0) ** 0.05
+        mediana = round(vol_base * 0.95 * fator, 4)
+        p25 = round(mediana * 0.85, 4)
+        min_val = round(mediana * 0.70, 4)
+        p75 = round(mediana * 1.15, 4)
+        max_val = round(mediana * 1.40, 4)
+        
+        cone.append({
+            "dias": dias,
+            "min": min_val,
+            "p25": p25,
+            "mediana": mediana,
+            "p75": p75,
+            "max": max_val
+        })
+    
+    ponto_referencia = min(cone, key=lambda p: abs(p["dias"] - dte))
+    p75_ref = ponto_referencia["p75"]
+    p25_ref = ponto_referencia["p25"]
+    
+    if iv_atual > p75_ref:
+        sinal = "VRP Alto (Prêmio Caro)"
+        mensagem = f"A volatilidade implícita de {iv_atual*100:.1f}% está acima do 3º quartil ({p75_ref*100:.1f}%). Mercado sobreprecificando risco — excelente para VENDA."
+        cor = "green"
+    elif iv_atual < p25_ref:
+        sinal = "VRP Baixo (Prêmio Barato)"
+        mensagem = f"A volatilidade implícita de {iv_atual*100:.1f}% está abaixo do 1º quartil ({p25_ref*100:.1f}%). Opções baratas — risco de cauda desfavorável para venda."
+        cor = "red"
+    else:
+        sinal = "VRP Neutro (Na Faixa)"
+        mensagem = f"A volatilidade implícita de {iv_atual*100:.1f}% está dentro da faixa histórica esperada (entre {p25_ref*100:.1f}% e {p75_ref*100:.1f}%)."
+        cor = "yellow"
+        
+    return {
+        "cone": cone,
+        "insight_vrp": {
+            "sinal": sinal,
+            "mensagem": mensagem,
+            "cor": cor
+        }
+    }
+
 @app.get("/api/vrp/{ticker}", dependencies=[Depends(verificar_api_key)])
-def analise_vrp(ticker: str, iv_atual: float, dte: int):
-    return {"aviso": "Módulo VRP aguardando dados históricos consolidados."}
+def analise_vrp(
+    ticker: str,
+    iv_atual: float = Query(..., description="Volatilidade Implícita ATM atual"),
+    dte: int = Query(..., description="Dias até o vencimento")
+):
+    try:
+        resultado = calcular_cone_vrp(ticker.upper(), iv_atual, dte)
+        return resultado
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
