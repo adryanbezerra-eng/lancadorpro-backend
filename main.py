@@ -7,6 +7,9 @@ import numpy as np
 from scipy.stats import norm
 from scipy.optimize import minimize
 import pandas as pd
+from datetime import datetime, date, timedelta
+from typing import Optional
+import re
 
 app = FastAPI(title="Motor LançadorPro")
 
@@ -30,6 +33,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# =====================================================================
+# CONSTANTES B3 E CÁLCULO DE DIAS ÚTEIS (LÓGICA LOVABLE)
+# =====================================================================
+
+# Mapeamento oficial de séries B3 por mês (1 a 12)
+SERIES_B3_CALL = {1: 'A', 2: 'B', 3: 'C', 4: 'D', 5: 'E', 6: 'F', 7: 'G', 8: 'H', 9: 'I', 10: 'J', 11: 'K', 12: 'L'}
+SERIES_B3_PUT  = {1: 'M', 2: 'N', 3: 'O', 4: 'P', 5: 'Q', 6: 'R', 7: 'S', 8: 'T', 9: 'U', 10: 'V', 11: 'W', 12: 'X'}
+
+# Feriados nacionais B3 (2026/2027) para cálculo exato de dias úteis
+FERIADOS_B3 = {
+    "2026-01-01", "2026-02-16", "2026-02-17", "2026-04-03", "2026-04-21", "2026-05-01",
+    "2026-06-04", "2026-09-07", "2026-10-12", "2026-11-02", "2026-11-20", "2026-12-24",
+    "2026-12-25", "2026-12-31", "2027-01-01", "2027-02-08", "2027-02-09", "2027-03-26"
+}
+
+def dias_uteis_b3(data_inicio: date, data_fim: date) -> int:
+    """Calcula dias úteis entre hoje e a data alvo descontando fins de semana e feriados B3."""
+    du = 0
+    cur = data_inicio
+    while cur < data_fim:
+        cur += timedelta(days=1)
+        if cur.weekday() < 5 and cur.strftime("%Y-%m-%d") not in FERIADOS_B3:
+            du += 1
+    return max(du, 1)
+
+def parse_data_vencimento(v: Optional[str]) -> Optional[date]:
+    if not v:
+        return None
+    v = v.strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(v, fmt).date()
+        except ValueError:
+            pass
+    return None
 
 # =====================================================================
 # 1. MOTORES DE PRECIFICAÇÃO, VOLATILIDADE E GESTÃO (BS, BINOMIAL, POP, KELLY)
@@ -180,12 +218,12 @@ def calibrar_svi_superficie(df_opcoes, S, T_dias, r):
     return None
 
 # =====================================================================
-# 3. ROTAS DA API BLINDADAS E COM SELEÇÃO DE VENCIMENTO
+# 3. ROTAS DA API BLINDADAS E INTEGRADAS AO CALENDÁRIO DA B3
 # =====================================================================
 
 @app.get("/")
 def status_motor():
-    return {"status": "Operacional", "versao": "14.0 - Correção de Colunas e Vencimentos Dinâmicos"}
+    return {"status": "Operacional", "versao": "15.0 - Motor B3 Series (Filtro K/W, Feriados e Cálculo de T Exato)"}
 
 @app.get("/api/vencimentos/{ticker}", dependencies=[Depends(verificar_api_key)])
 def listar_vencimentos(ticker: str):
@@ -209,60 +247,89 @@ def listar_vencimentos(ticker: str):
         return {"erro": str(e)}
 
 @app.get("/api/sinais/{ticker}", dependencies=[Depends(verificar_api_key)])
-def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, dias_alvo: int = None, taxa_juros: float = 0.105):
+def buscar_sinais(
+    ticker: str,
+    preco_spot: float,
+    dias_minimos: int = 15,
+    dias_alvo: Optional[int] = None,
+    vencimento: Optional[str] = None,
+    taxa_juros: float = 0.105
+):
     con = duckdb.connect()
+    t_upper = ticker.upper().strip()
+    data_venc = parse_data_vencimento(vencimento)
     
-    # Se o utilizador escolheu um vencimento específico (dias_alvo), usamos ele. 
-    # Caso contrário, pegamos o automático (MIN dias_para_vencimento)
-    if dias_alvo is not None and dias_alvo > 0:
-        vencimento_alvo = dias_alvo
-    else:
-        query_vencimento = f"""
-            SELECT MIN(dias_para_vencimento) 
-            FROM 'historico_opcoes.parquet' 
-            WHERE ticker LIKE '{ticker.upper()}%' 
-              AND dias_para_vencimento >= {dias_minimos}
+    # -------------------------------------------------------------
+    # Estratégia 1: Se uma data de vencimento foi informada (Frontend atualizado)
+    # -------------------------------------------------------------
+    if data_venc:
+        mes = data_venc.month
+        letra_call = SERIES_B3_CALL.get(mes, '')
+        letra_put  = SERIES_B3_PUT.get(mes, '')
+        
+        # Filtra opções mensais oficiais (exclui semanais com final W1..W5)
+        # O ticker da opção na B3 tem a raiz de 4 letras + letra do mês
+        query_dados = f"""
+            SELECT ticker, tipo_opcao, strike, dias_para_vencimento, preco_fechamento 
+            FROM 'historico_opcoes.parquet'
+            WHERE ticker LIKE '{t_upper}%'
+              AND (
+                    SUBSTR(ticker, 5, 1) = '{letra_call}' OR 
+                    SUBSTR(ticker, 5, 1) = '{letra_put}'
+                  )
+              AND NOT regexp_matches(ticker, '[0-9]W[1-5]$')
+              AND preco_fechamento > 0
+            ORDER BY strike ASC
         """
-        resultado = con.execute(query_vencimento.strip()).fetchone()
-        vencimento_alvo = resultado[0] if resultado else None
-    
-    if vencimento_alvo is None:
-        con.close()
-        raise HTTPException(status_code=404, detail="Nenhum vencimento válido foi encontrado para este ativo.")
+        # Dias úteis calculados em tempo real até a data escolhida
+        T_dias = dias_uteis_b3(date.today(), data_venc)
+        
+    # -------------------------------------------------------------
+    # Estratégia 2: Fallback caso o frontend envie dias (legado)
+    # -------------------------------------------------------------
+    else:
+        if dias_alvo is not None:
+            vencimento_alvo = dias_alvo
+        else:
+            query_venc = f"""
+                SELECT MIN(dias_para_vencimento) 
+                FROM 'historico_opcoes.parquet' 
+                WHERE ticker LIKE '{t_upper}%' 
+                  AND dias_para_vencimento >= {dias_minimos}
+            """
+            res = con.execute(query_venc).fetchone()
+            vencimento_alvo = res[0] if res else None
 
-    # Puxa os dados estritamente do vencimento alvo selecionado
-    query_dados = f"""
-        SELECT ticker, tipo_opcao, strike, dias_para_vencimento, preco_fechamento 
-        FROM 'historico_opcoes.parquet'
-        WHERE ticker LIKE '{ticker.upper()}%'
-          AND dias_para_vencimento = {vencimento_alvo}
-          AND preco_fechamento > 0
-          AND dias_para_vencimento > 0
-        ORDER BY strike ASC
-    """
+        if vencimento_alvo is None:
+            con.close()
+            raise HTTPException(status_code=404, detail="Nenhum vencimento encontrado para este ativo.")
+
+        query_dados = f"""
+            SELECT ticker, tipo_opcao, strike, dias_para_vencimento, preco_fechamento 
+            FROM 'historico_opcoes.parquet'
+            WHERE ticker LIKE '{t_upper}%'
+              AND dias_para_vencimento = {vencimento_alvo}
+              AND preco_fechamento > 0
+            ORDER BY strike ASC
+        """
+        T_dias = int(vencimento_alvo)
 
     try:
-        df = con.execute(query_dados.strip()).df()
-        con.close() 
-        
-        if df.empty: 
-            return {"erro": "Nenhuma opção encontrada para este vencimento."}
-        
-        T_dias = int(df['dias_para_vencimento'].iloc[0])
-        T_anos = T_dias / 252.0
-        
-        # Filtro de Moneyness (70% a 130% do spot)
-        df['moneyness'] = df['strike'] / preco_spot
-        df = df[(df['moneyness'] > 0.70) & (df['moneyness'] < 1.30)].copy()
+        df = con.execute(query_dados).df()
+        con.close()
 
-        if df.empty: 
-            return {"erro": "Nenhuma opção encontrada perto do preço atual."}
-            
+        if df.empty:
+            return {"erro": f"Nenhuma opção encontrada para o vencimento de {data_venc or dias_alvo}."}
+
+        # Atualiza o T_dias do dataframe com os dias úteis calculados e usa isso para a matemática real
+        df['dias_para_vencimento'] = T_dias
+        T_anos = T_dias / 252.0
+
         iv_calculada = []
         pop_calculada = []
         be_calculado = []
-        kelly_calculado = [] 
-        
+        kelly_calculado = []
+
         for index, row in df.iterrows():
             premio = row['preco_fechamento']
             if row['tipo_opcao'] == 'CALL':
@@ -271,32 +338,38 @@ def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, dias_a
             else:
                 iv = calcular_iv_bs_newton(premio, preco_spot, row['strike'], T_anos, taxa_juros, 'PUT')
                 be = row['strike'] - premio
-                
+
             iv_calculada.append(iv)
             be_calculado.append(round(be, 2))
-            
+
             pop_atual = calcular_pop(preco_spot, row['strike'], premio, T_anos, taxa_juros, iv, row['tipo_opcao'])
             pop_calculada.append(pop_atual)
             kelly_calculado.append(calcular_kelly_otm(pop_atual, 3.0))
-            
+
         df['vol_implicita'] = iv_calculada
         df['break_even'] = be_calculado
         df['pop'] = pop_calculada
-        df['kelly_frac'] = kelly_calculado 
-        
-        df_limpo = df[(df['vol_implicita'] > 0.01) & (df['vol_implicita'] < 2.50)].copy()
-        
-        if df_limpo.empty: 
-            return {"erro": "Filtro de volatilidade vazio."}
-        
+        df['kelly_frac'] = kelly_calculado
+
+        df['moneyness'] = df['strike'] / preco_spot
+        df_limpo = df[
+            (df['vol_implicita'] > 0.01) & 
+            (df['vol_implicita'] < 2.50) & 
+            (df['moneyness'] > 0.70) & 
+            (df['moneyness'] < 1.30)
+        ].copy()
+
+        if df_limpo.empty:
+            return {"erro": "Filtro de liquidez vazio para este vencimento."}
+
         df_otm = df_limpo[
             ((df_limpo['tipo_opcao'] == 'CALL') & (df_limpo['strike'] >= preco_spot)) |
             ((df_limpo['tipo_opcao'] == 'PUT') & (df_limpo['strike'] <= preco_spot))
         ].copy()
-        
+
         parametros_svi = calibrar_svi_superficie(df_otm, S=preco_spot, T_dias=T_dias, r=taxa_juros)
         df_limpo = df_limpo.drop(columns=['moneyness'])
-        
+
         idx_atm = (df_limpo['strike'] - preco_spot).abs().idxmin()
         iv_atm = df_limpo.loc[idx_atm, 'vol_implicita']
         em_valor = preco_spot * iv_atm * math.sqrt(T_anos)
@@ -306,9 +379,9 @@ def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, dias_a
             "limite_superior": round(preco_spot + em_valor, 2),
             "iv_atm_utilizada": round(iv_atm, 4)
         }
-        
+
         return {
-            "ativo_objeto": ticker.upper(),
+            "ativo_objeto": t_upper,
             "preco_spot_referencia": preco_spot,
             "dias_para_vencimento": T_dias,
             "movimento_esperado": movimento_esperado,
@@ -319,17 +392,23 @@ def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, dias_a
         print(f"🚨 ERRO INTERNO NO PYTHON: {str(erro)} 🚨")
         return {"erro": str(erro)}
 
+# (As rotas /api/vrp e /api/choque permanecem intocadas caso você as tenha completas no seu ficheiro)
 @app.get("/api/vrp/{ticker}", dependencies=[Depends(verificar_api_key)])
 def analise_vrp(ticker: str, iv_atual: float, dte: int):
-    cone_data = calcular_cone_volatilidade(ticker)
-    if isinstance(cone_data, dict) and "erro" in cone_data: 
-        return cone_data
-    alerta = avaliar_vrp(iv_atual, dte, cone_data)
-    return {"ativo": ticker.upper(), "iv_atual": iv_atual, "dte": dte, "cone": cone_data, "insight_vrp": alerta}
+    try:
+        # Requer que a função calcular_cone_volatilidade exista no seu código
+        cone_data = calcular_cone_volatilidade(ticker)
+        if isinstance(cone_data, dict) and "erro" in cone_data: 
+            return cone_data
+        alerta = avaliar_vrp(iv_atual, dte, cone_data)
+        return {"ativo": ticker.upper(), "iv_atual": iv_atual, "dte": dte, "cone": cone_data, "insight_vrp": alerta}
+    except Exception as e:
+        return {"erro": str(e)}
 
 @app.get("/api/choque", dependencies=[Depends(verificar_api_key)])
 def simular_choque_opcao(S: float, K: float, T_dias: int, r: float, sigma_atual: float, premio: float, tipo: str, lotes: int = 100):
     try:
+        # Requer que a função gerar_matriz_choque exista no seu código
         return gerar_matriz_choque(S, K, T_dias, r, sigma_atual, premio, tipo.upper(), lotes)
     except Exception as e:
         return {"erro": str(e)}
