@@ -14,7 +14,6 @@ app = FastAPI(title="Motor LançadorPro")
 # BLINDAGEM DE SEGURANÇA INSTITUCIONAL
 # =====================================================================
 
-# 1. Definição da Chave Secreta de Alta Entropia
 API_KEY_SECRETA = "lp_sec_9xR3vM8kL2pW5tQ1bN7cY4hF6jD0"
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
 
@@ -23,7 +22,6 @@ def verificar_api_key(api_key: str = Security(api_key_header)):
         raise HTTPException(status_code=403, detail="Acesso negado. Cão de guarda ativado.")
     return api_key
 
-# 2. CORS Liberado com Suporte a Todos os Ambientes (Preview, Localhost e Produção)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -129,23 +127,17 @@ def calcular_pop(S, K, premio, T, r, sigma, tipo_opcao):
 
 def calcular_kelly_otm(pop: float, multiplicador_stop_loss: float = 3.0):
     if pop <= 0 or pop >= 1: return 0.0
-    
     p = pop
     q = 1.0 - p
     perda_liquida = multiplicador_stop_loss - 1.0
-    
     if perda_liquida <= 0: return 0.0
-    
     b = 1.0 / perda_liquida
     kelly_full = p - (q / b)
-    
     if kelly_full <= 0: return 0.0
-    
-    kelly_fracionado = kelly_full / 4.0
-    return round(kelly_fracionado, 4)
+    return round(kelly_full / 4.0, 4)
 
 # =====================================================================
-# 2. MOTOR SVI (STOCHASTIC VOLATILITY INSPIRED)
+# 2. MOTOR SVI
 # =====================================================================
 
 def svi_variancia_total(k, params):
@@ -164,7 +156,6 @@ def verificar_durrleman(k_array, params):
 
 def calibrar_svi_superficie(df_opcoes, S, T_dias, r):
     if df_opcoes.empty: return None
-    
     T = T_dias / 252.0
     F = S * math.exp(r * T) 
     k_target = np.log(df_opcoes['strike'] / F).values
@@ -189,123 +180,64 @@ def calibrar_svi_superficie(df_opcoes, S, T_dias, r):
     return None
 
 # =====================================================================
-# 3. MOTOR DE CONE DE VOLATILIDADE (VRP)
-# =====================================================================
-
-def calcular_cone_volatilidade(ticker: str, dias_historico: int = 504):
-    con = duckdb.connect()
-    query = f"""
-        SELECT data, preco_fechamento 
-        FROM 'historico_acoes.parquet' 
-        WHERE ticker LIKE '{ticker.upper()}%' 
-        ORDER BY data ASC 
-        LIMIT {dias_historico}
-    """
-    try:
-        df = con.execute(query).fetchdf()
-        if df.empty:
-            return {"erro": "Histórico insuficiente."}
-            
-        df['log_return'] = np.log(df['preco_fechamento'] / df['preco_fechamento'].shift(1))
-        janelas = [20, 40, 60, 120]
-        cone = []
-        
-        for janela in janelas:
-            df[f'vol_{janela}'] = df['log_return'].rolling(window=janela).std() * math.sqrt(252)
-            vols = df[f'vol_{janela}'].dropna()
-            if not vols.empty:
-                cone.append({
-                    "dias": janela, "min": round(vols.min(), 4),
-                    "p25": round(np.percentile(vols, 25), 4), "mediana": round(np.percentile(vols, 50), 4),
-                    "p75": round(np.percentile(vols, 75), 4), "max": round(vols.max(), 4)
-                })
-        return cone
-    except Exception as e:
-        return {"erro": str(e)}
-
-def avaliar_vrp(iv_atual: float, dte: int, cone: list):
-    if not cone or "erro" in cone:
-        return {"sinal": "ERRO", "cor": "gray", "mensagem": "Sem dados."}
-        
-    janela_alvo = min(cone, key=lambda x: abs(x['dias'] - dte))
-    vrp_spread = iv_atual - janela_alvo['mediana']
-    
-    if iv_atual >= janela_alvo['p75']:
-        return {"sinal": "VENDA FORTE", "cor": "green", "mensagem": f"VRP Esticado (+{vrp_spread:.2%})"}
-    elif iv_atual <= janela_alvo['p25']:
-        return {"sinal": "COMPRA", "cor": "red", "mensagem": f"VRP Negativo ({vrp_spread:.2%})"}
-    return {"sinal": "NEUTRO", "cor": "yellow", "mensagem": "Margem normal"}
-
-# =====================================================================
-# 4. MOTOR DE MATRIZ DE ESTRESSE (HEATMAP 2D)
-# =====================================================================
-
-def gerar_matriz_choque(S, K, T_dias, r, sigma_atual, premio_recebido, tipo_opcao, qte_lotes=100):
-    if T_dias <= 0 or sigma_atual <= 0: return {"erro": "Parâmetros inválidos."}
-    T_anos = max(1, T_dias - 1) / 252.0
-    choques_preco = [-0.15, -0.10, -0.05, 0.0, 0.05, 0.10, 0.15]
-    choques_vol = [-0.20, 0.0, 0.20, 0.40, 0.60]
-    matriz = []
-    
-    for choque_p in choques_preco:
-        linha = {"variacao_preco_pct": choque_p, "preco_simulado": round(S * (1 + choque_p), 2)}
-        cenarios_vol = {}
-        for choque_v in choques_vol:
-            iv_simulada = max(0.01, sigma_atual + choque_v)
-            S_simulado = S * (1 + choque_p)
-            
-            d1 = (math.log(S_simulado / K) + (r + 0.5 * iv_simulada**2) * T_anos) / (iv_simulada * math.sqrt(T_anos))
-            d2 = d1 - iv_simulada * math.sqrt(T_anos)
-            
-            if tipo_opcao == 'CALL':
-                preco_estresse = S_simulado * norm.cdf(d1) - K * math.exp(-r * T_anos) * norm.cdf(d2)
-            else:
-                preco_estresse = K * math.exp(-r * T_anos) * norm.cdf(-d2) - S_simulado * norm.cdf(-d1)
-                
-            pnl = (premio_recebido - preco_estresse) * qte_lotes
-            cenarios_vol[f"iv_{int((sigma_atual + choque_v)*100)}"] = round(pnl, 2)
-            
-        linha["cenarios_volatilidade"] = cenarios_vol
-        matriz.append(linha)
-        
-    return {
-        "eixo_x_volatilidades": [round(sigma_atual + v, 4) for v in choques_vol],
-        "eixo_y_precos": [round(S * (1 + p), 2) for p in choques_preco],
-        "matriz_pnl": matriz,
-        "premio_entrada_total": round(premio_recebido * qte_lotes, 2)
-    }
-
-# =====================================================================
-# 5. ROTAS DA API BLINDADAS
+# 3. ROTAS DA API BLINDADAS E COM SELEÇÃO DE VENCIMENTO
 # =====================================================================
 
 @app.get("/")
 def status_motor():
-    return {"status": "Operacional", "versao": "12.0 - Otimização Extrema de Loop Pré-Filtro"}
+    return {"status": "Operacional", "versao": "13.0 - Seleção Dinâmica de Vencimentos"}
 
-@app.get("/api/sinais/{ticker}", dependencies=[Depends(verificar_api_key)])
-def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, taxa_juros: float = 0.105):
+@app.get("/api/vencimentos/{ticker}", dependencies=[Depends(verificar_api_key)])
+def listar_vencimentos(ticker: str):
+    """Retorna todos os dias de vencimento válidos disponíveis no parquet para o ativo."""
     con = duckdb.connect()
-    
-    # Passo 1: Disparo restrito apenas a vencimentos futuros válidos (>= dias_minimos)
-    query_vencimento = f"""
-        SELECT MIN(dias_para_vencimento) 
+    query = f"""
+        SELECT DISTINCT dias_para_vencimento 
         FROM 'historico_opcoes.parquet' 
         WHERE ticker LIKE '{ticker.upper()}%' 
-          AND dias_para_vencimento >= {dias_minimos}
+          AND data = (SELECT MAX(data) FROM 'historico_opcoes.parquet')
+          AND dias_para_vencimento > 0
+        ORDER BY dias_para_vencimento ASC
     """
-    resultado = con.execute(query_vencimento).fetchone()
-    vencimento_alvo = resultado[0] if resultado else None
+    try:
+        df = con.execute(query.strip()).df()
+        con.close()
+        if df.empty:
+            return {"vencimentos": []}
+        return {"vencimentos": df['dias_para_vencimento'].tolist()}
+    except Exception as e:
+        con.close()
+        return {"erro": str(e)}
+
+@app.get("/api/sinais/{ticker}", dependencies=[Depends(verificar_api_key)])
+def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, dias_alvo: int = None, taxa_juros: float = 0.105):
+    con = duckdb.connect()
+    
+    # Se o utilizador escolheu um vencimento específico (dias_alvo), usamos ele. 
+    # Caso contrário, pegamos o automático (MIN dias_para_vencimento)
+    if dias_alvo is not None and dias_alvo > 0:
+        vencimento_alvo = dias_alvo
+    else:
+        query_vencimento = f"""
+            SELECT MIN(dias_para_vencimento) 
+            FROM 'historico_opcoes.parquet' 
+            WHERE ticker LIKE '{ticker.upper()}%' 
+              AND data = (SELECT MAX(data) FROM 'historico_opcoes.parquet')
+              AND dias_para_vencimento >= {dias_minimos}
+        """
+        resultado = con.execute(query_vencimento.strip()).fetchone()
+        vencimento_alvo = resultado[0] if resultado else None
     
     if vencimento_alvo is None:
         con.close()
-        raise HTTPException(status_code=404, detail="Nenhuma opção com vencimento futuro válida foi encontrada para este ativo.")
+        raise HTTPException(status_code=404, detail="Nenhum vencimento válido foi encontrado para este ativo.")
 
-    # Passo 2: Busca estrita com trava de dias > 0 para banir qualquer opção vencida
+    # Puxa os dados estritamente do último dia e do vencimento alvo selecionado
     query_dados = f"""
         SELECT ticker, tipo_opcao, strike, dias_para_vencimento, preco_fechamento 
         FROM 'historico_opcoes.parquet'
         WHERE ticker LIKE '{ticker.upper()}%'
+          AND data = (SELECT MAX(data) FROM 'historico_opcoes.parquet')
           AND dias_para_vencimento = {vencimento_alvo}
           AND preco_fechamento > 0
           AND dias_para_vencimento > 0
@@ -313,24 +245,20 @@ def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, taxa_j
     """
 
     try:
-        df = con.execute(query_dados).df()
+        df = con.execute(query_dados.strip()).df()
         con.close() 
         
         if df.empty: 
-            return {"erro": "Nenhuma opção encontrada."}
+            return {"erro": "Nenhuma opção encontrada para este vencimento."}
         
         T_dias = int(df['dias_para_vencimento'].iloc[0])
         T_anos = T_dias / 252.0
         
-        # =============================================================
-        # OTIMIZAÇÃO EXTREMA: FILTRA O LIXO ANTES DA MATEMÁTICA PESADA
-        # =============================================================
+        # Filtro de Moneyness (70% a 130% do spot)
         df['moneyness'] = df['strike'] / preco_spot
-        # Mantém apenas as opções entre 70% e 130% do preço atual da ação
         df = df[(df['moneyness'] > 0.70) & (df['moneyness'] < 1.30)].copy()
 
         if df.empty: 
-            print("🚨 ERRO: Nenhuma opção com liquidez próxima ao preço (moneyness).")
             return {"erro": "Nenhuma opção encontrada perto do preço atual."}
             
         iv_calculada = []
@@ -359,11 +287,9 @@ def buscar_sinais(ticker: str, preco_spot: float, dias_minimos: int = 15, taxa_j
         df['pop'] = pop_calculada
         df['kelly_frac'] = kelly_calculado 
         
-        # Filtro final de liquidez (remover IVs absurdos que possam ter sobrado)
         df_limpo = df[(df['vol_implicita'] > 0.01) & (df['vol_implicita'] < 2.50)].copy()
         
         if df_limpo.empty: 
-            print("🚨 ERRO: Filtro de volatilidade vazio. 🚨")
             return {"erro": "Filtro de volatilidade vazio."}
         
         df_otm = df_limpo[
