@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Security
+from fastapi import FastAPI, Depends, HTTPException, Security, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 import duckdb
@@ -40,7 +40,7 @@ app.add_middleware(
 SERIES_B3_CALL = {1: 'A', 2: 'B', 3: 'C', 4: 'D', 5: 'E', 6: 'F', 7: 'G', 8: 'H', 9: 'I', 10: 'J', 11: 'K', 12: 'L'}
 SERIES_B3_PUT  = {1: 'M', 2: 'N', 3: 'O', 4: 'P', 5: 'Q', 6: 'R', 7: 'S', 8: 'T', 9: 'U', 10: 'V', 11: 'W', 12: 'X'}
 
-# Feriados nacionais B3 (2026/2027) para cálculo exato de dias úteis
+# Feriados nacionais B3 (2026/2027)
 FERIADOS_B3 = {
     "2026-01-01", "2026-02-16", "2026-02-17", "2026-04-03", "2026-04-21", "2026-05-01",
     "2026-06-04", "2026-09-07", "2026-10-12", "2026-11-02", "2026-11-20", "2026-12-24",
@@ -48,7 +48,6 @@ FERIADOS_B3 = {
 }
 
 def dias_uteis_b3(data_inicio: date, data_fim: date) -> int:
-    """Calcula dias úteis entre hoje e a data alvo descontando fins de semana e feriados B3."""
     du = 0
     cur = data_inicio
     while cur < data_fim:
@@ -69,8 +68,23 @@ def parse_data_vencimento(v: Optional[str]) -> Optional[date]:
     return None
 
 # =====================================================================
-# 1. MOTORES DE PRECIFICAÇÃO, VOLATILIDADE E GESTÃO (BS, BINOMIAL, POP, KELLY)
+# 1. MOTORES DE PRECIFICAÇÃO, VOLATILIDADE E GESTÃO
 # =====================================================================
+
+def calcular_preco_bs(S, K, T, r, sigma, tipo):
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        if tipo.upper() == "CALL":
+            return max(0.0, S - K)
+        else:
+            return max(0.0, K - S)
+            
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    
+    if tipo.upper() == "CALL":
+        return S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
+    else:
+        return K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
 def calcular_iv_bs_newton(preco_mercado, S, K, T, r, tipo_opcao):
     if T <= 0 or preco_mercado <= 0: return 0.0
@@ -174,7 +188,7 @@ def calcular_kelly_otm(pop: float, multiplicador_stop_loss: float = 3.0):
     return round(kelly_full / 4.0, 4)
 
 # =====================================================================
-# 2. MOTOR SVI
+# 2. MOTOR SVI (STOCHASTIC VOLATILITY INSPIRED)
 # =====================================================================
 
 def svi_variancia_total(k, params):
@@ -217,12 +231,12 @@ def calibrar_svi_superficie(df_opcoes, S, T_dias, r):
     return None
 
 # =====================================================================
-# 3. ROTAS DA API BLINDADAS (PERFORMANCE MÁXIMA E VENCIMENTO DINÂMICO)
+# 3. ROTAS DA API PRINCIPAIS
 # =====================================================================
 
 @app.get("/")
 def status_motor():
-    return {"status": "Operacional", "versao": "16.0 - Otimização Extrema arg_min e NOT LIKE"}
+    return {"status": "Operacional", "versao": "18.0 - Motor Completo com Matriz de Choque (Preço vs Volatilidade)"}
 
 @app.get("/api/vencimentos/{ticker}", dependencies=[Depends(verificar_api_key)])
 def listar_vencimentos(ticker: str):
@@ -257,15 +271,11 @@ def buscar_sinais(
     t_upper = ticker.upper().strip()
     data_venc = parse_data_vencimento(vencimento)
     
-    # -------------------------------------------------------------
-    # Estratégia 1: Data de Vencimento Dinâmica Oficial
-    # -------------------------------------------------------------
     if data_venc:
         mes = data_venc.month
         letra_call = SERIES_B3_CALL.get(mes, '')
         letra_put  = SERIES_B3_PUT.get(mes, '')
         
-        # Filtros ultrarrápidos usando GROUP BY e arg_min para pegar apenas o dia mais recente
         query_dados = f"""
             SELECT 
                 ticker, 
@@ -290,9 +300,6 @@ def buscar_sinais(
         """
         T_dias = dias_uteis_b3(date.today(), data_venc)
         
-    # -------------------------------------------------------------
-    # Estratégia 2: Fallback Clássico (Caso Frontend envie dias)
-    # -------------------------------------------------------------
     else:
         if dias_alvo is not None:
             vencimento_alvo = dias_alvo
@@ -310,7 +317,6 @@ def buscar_sinais(
             con.close()
             raise HTTPException(status_code=404, detail="Nenhum vencimento encontrado para este ativo.")
 
-        # Otimizado também para fallback
         query_dados = f"""
             SELECT 
                 ticker, 
@@ -328,14 +334,12 @@ def buscar_sinais(
         T_dias = int(vencimento_alvo)
 
     try:
-        # Execução Ultrarrápida no DuckDB
         df = con.execute(query_dados).df()
         con.close()
 
         if df.empty:
             return {"erro": f"Nenhuma opção encontrada para o vencimento de {data_venc or dias_alvo}."}
 
-        # Atualiza dias úteis exatos
         df['dias_para_vencimento'] = T_dias
         T_anos = T_dias / 252.0
 
@@ -344,7 +348,6 @@ def buscar_sinais(
         be_calculado = []
         kelly_calculado = []
 
-        # Processamento Matemático
         for index, row in df.iterrows():
             premio = row['preco_fechamento']
             if row['tipo_opcao'] == 'CALL':
@@ -366,7 +369,6 @@ def buscar_sinais(
         df['pop'] = pop_calculada
         df['kelly_frac'] = kelly_calculado
 
-        # Limpeza de liquidez extrema (Moneyness e Volatilidade)
         df['moneyness'] = df['strike'] / preco_spot
         df_limpo = df[
             (df['vol_implicita'] > 0.01) & 
@@ -378,7 +380,6 @@ def buscar_sinais(
         if df_limpo.empty:
             return {"erro": "Filtro de liquidez vazio para este vencimento."}
 
-        # Subconjunto OTM para calibrar SVI
         df_otm = df_limpo[
             ((df_limpo['tipo_opcao'] == 'CALL') & (df_limpo['strike'] >= preco_spot)) |
             ((df_limpo['tipo_opcao'] == 'PUT') & (df_limpo['strike'] <= preco_spot))
@@ -387,7 +388,6 @@ def buscar_sinais(
         parametros_svi = calibrar_svi_superficie(df_otm, S=preco_spot, T_dias=T_dias, r=taxa_juros)
         df_limpo = df_limpo.drop(columns=['moneyness'])
 
-        # Movimento Esperado ATM
         idx_atm = (df_limpo['strike'] - preco_spot).abs().idxmin()
         iv_atm = df_limpo.loc[idx_atm, 'vol_implicita']
         em_valor = preco_spot * iv_atm * math.sqrt(T_anos)
@@ -410,18 +410,63 @@ def buscar_sinais(
         print(f"🚨 ERRO INTERNO NO PYTHON: {str(erro)} 🚨")
         return {"erro": str(erro)}
 
-@app.get("/api/vrp/{ticker}", dependencies=[Depends(verificar_api_key)])
-def analise_vrp(ticker: str, iv_atual: float, dte: int):
-    # Rota mantida de reserva caso use o cone de volatilidade
-    try:
-        return {"aviso": "Função calcular_cone_volatilidade necessita estar definida para operação completa."}
-    except Exception as e:
-        return {"erro": str(e)}
+
+# =====================================================================
+# 4. MOTOR DE MATRIZ DE CHOQUE E ANÁLISE DE RISCO (FRONTEND COMPATÍVEL)
+# =====================================================================
+
+def gerar_matriz_choque(S: float, K: float, T_dias: int, r: float, sigma_atual: float, premio: float, tipo: str, lotes: int = 100):
+    T_anos = max(1, T_dias) / 252.0
+    
+    # 5 cenários de volatilidade (-10%, -5%, 0%, +5%, +10% em pontos absolutos de vol)
+    choques_vol = [-0.10, -0.05, 0.0, +0.05, +0.10]
+    eixo_vol = [max(0.01, round(sigma_atual + delta, 4)) for delta in choques_vol]
+    
+    # 7 cenários de preço (-15%, -10%, -5%, 0%, +5%, +10%, +15%)
+    variacoes_preco = [-15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0]
+    
+    matriz_pnl = []
+    
+    for var_pct in variacoes_preco:
+        S_sim = round(S * (1.0 + var_pct / 100.0), 2)
+        linha_pnl = []
+        
+        for vol_sim in eixo_vol:
+            preco_opcao_cenario = calcular_preco_bs(S_sim, K, T_anos, r, vol_sim, tipo)
+            
+            # Posição VENDIDA (Lançador): Lucro = (Prêmio recebido - Preço novo) * quantidade
+            pnl_unitario = premio - preco_opcao_cenario
+            pnl_total = round(pnl_unitario * lotes, 2)
+            linha_pnl.append(pnl_total)
+            
+        matriz_pnl.append({
+            "preco_simulado": S_sim,
+            "variacao_preco_pct": var_pct,
+            "pnl": linha_pnl
+        })
+        
+    return {
+        "eixo_x_volatilidades": eixo_vol,
+        "matriz_pnl": matriz_pnl
+    }
 
 @app.get("/api/choque", dependencies=[Depends(verificar_api_key)])
-def simular_choque_opcao(S: float, K: float, T_dias: int, r: float, sigma_atual: float, premio: float, tipo: str, lotes: int = 100):
-    # Rota mantida de reserva para a matriz de choque
+def simular_choque(
+    S: float = Query(..., description="Preço Spot"),
+    K: float = Query(..., description="Strike"),
+    T_dias: int = Query(..., description="Dias até o vencimento"),
+    r: float = Query(0.105, description="Taxa de juros livre de risco"),
+    sigma_atual: float = Query(..., description="Volatilidade implícita atual"),
+    premio: float = Query(..., description="Prêmio de mercado"),
+    tipo: str = Query(..., description="CALL ou PUT"),
+    lotes: int = Query(100, description="Tamanho da posição")
+):
     try:
-        return {"aviso": "Função gerar_matriz_choque necessita estar definida para operação completa."}
+        dados = gerar_matriz_choque(S, K, T_dias, r, sigma_atual, premio, tipo, lotes)
+        return dados
     except Exception as e:
-        return {"erro": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/vrp/{ticker}", dependencies=[Depends(verificar_api_key)])
+def analise_vrp(ticker: str, iv_atual: float, dte: int):
+    return {"aviso": "Módulo VRP aguardando dados históricos consolidados."}
