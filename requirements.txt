@@ -4,3 +4,4 @@ duckdb
 numpy
 scipy
 pandas
+yfinance
